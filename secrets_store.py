@@ -21,7 +21,7 @@ def keychain_value(name):
 
 
 def get_secret(name):
-    return keychain_value(name) or os.getenv(name)
+    return os.getenv(name) or keychain_value(name)  # .env wins, so editing it always takes effect
 
 
 def save_secret(name, value):

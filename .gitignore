@@ -10,3 +10,4 @@ cache/
 build/
 dist/
 .eggs/
+assets/icon.iconset/

@@ -1,5 +1,5 @@
-"""Push to talk Mac assistant: hold right Option, speak, release. Jev decides, Fish speaks."""
-import os, sys, time, random, argparse, subprocess, tempfile, threading, hashlib
+"""Mac voice assistant: hold right Option or say "Hey Jev", then speak. Jev decides, Fish speaks."""
+import os, re, sys, time, queue, random, argparse, subprocess, tempfile, threading, hashlib, collections
 import numpy as np, requests, sounddevice as sd, soundfile as sf
 from dotenv import load_dotenv
 from pynput import keyboard
@@ -9,11 +9,16 @@ load_dotenv()
 TS_KEY = get_secret("TYPESAFE_API_KEY")
 FISH_KEY = get_secret("FISH_AUDIO_API_KEY")
 OR_KEY = get_secret("OPENROUTER_API_KEY")
-VOICE_ID = "933563129e564b19a115bedd57b7406a"  # Sarah, Fish Official
+VOICE_ID = "9a9cf47702da476aa4629e2506d4a857"
 PTT_KEY = keyboard.Key.alt_r
 SAMPLE_RATE = 16000
 GATE = 0.65
 WHISPER_MODEL = "small.en"
+COMMAND_PROMPT = "Open Spotify. Play. Pause. Next track. Turn Spotify down. Turn the Mac volume down. Mute. Dark mode on. Lock the screen."
+WAKE_PROMPT = "Hey Jev, open Spotify. Hey Jev, pause the music. Hey Jev, turn the volume down."
+# Whisper often hears "Jev" as Jeff or Jeb, so accept the close ones
+WAKE = re.compile(r"^\W*(?:hey|hi|hay|okay|ok|a)\W+(?:jev|jevs|jeff|jeffs|jef|jeb|jab|chev|jeve|jav)\b\W*", re.I)
+WAKE_WINDOW = 6.0
 
 
 def reload_keys():
@@ -162,28 +167,29 @@ REPLIES = {
     "app_open": ["[cheerful] {app}'s up.", "{app}, opening now.", "[chuckling] There you go, {app}."],
     "app_quit": ["{app}'s gone.", "[sighing] Closing {app}. Good riddance.", "Done, {app} is closed."],
     "volume_up": ["Louder it is.", "[cheerful] Turning it up.", "Up we go."],
-    "volume_down": ["Bringing it down.", "[whispering] A little quieter.", "Turning it down."],
+    "volume_down": ["Bringing it down.", "[sighing] A little quieter.", "Turning it down."],
     "volume_mute": ["[sighing] Muting. Finally some quiet.", "Muted.", "Shh. Muted."],
     "volume_unmute": ["Sound's back.", "[cheerful] Unmuted.", "And we're back."],
     "volume_set": ["Set to {level}.", "Volume's {level} now."],
     "spotify_volume_up": ["Turning Spotify up.", "[cheerful] Spotify's louder."],
-    "spotify_volume_down": ["Turning Spotify down.", "[whispering] Spotify's a little quieter."],
+    "spotify_volume_down": ["Turning Spotify down.", "Spotify's a little quieter."],
     "spotify_volume_mute": ["Spotify's muted.", "[sighing] Muting Spotify."],
     "spotify_volume_unmute": ["Spotify's sound is back.", "[cheerful] Spotify's unmuted."],
     "spotify_volume_set": ["Spotify's set to {level}.", "Set Spotify to {level}."],
-    "display_dark_on": ["[whispering] Lights off.", "Dark mode on.", "Going dark."],
+    "display_dark_on": ["[chuckling] Lights off.", "Dark mode on.", "Going dark."],
     "display_dark_off": ["[cheerful] Let there be light.", "Dark mode off.", "Back to light."],
     "display_toggle": ["Flipped it.", "There, switched."],
     "media_play": ["[cheerful] Playing.", "Music's on.", "Here we go."],
     "media_pause": ["Paused.", "[sighing] Pausing. Take your time.", "Holding it there."],
     "media_next": ["Skipping.", "[chuckling] Not a fan? Next one.", "Next track."],
     "media_previous": ["Going back one.", "Previous track.", "[chuckling] Again? Sure."],
-    "system_lock": ["[whispering] Locking up. See you soon.", "Locked.", "Screen's locked."],
-    "system_sleep": ["[whispering] Good night.", "Sleeping now.", "[sighing] Finally, a nap."],
+    "system_lock": ["Locking up. See you soon.", "Locked.", "Screen's locked."],
+    "system_sleep": ["Good night.", "Sleeping now.", "[sighing] Finally, a nap."],
     "info": ["[chuckling] That's a question, not a command. I'll get a brain for that soon.",
              "[sighing] I can't answer that one yet."],
     "chit_chat": ["[chuckling] Hi. Give me something to do.", "[cheerful] Hey. I'm listening."],
     "compound_done": ["[chuckling] Done, both of them.", "[cheerful] All done.", "Both sorted."],
+    "wake": ["Yes?", "[cheerful] Mm-hm?", "I'm listening."],
     "clarify": ["[clear throat] Sorry, say that again?", "Hm, one more time?"],
     "give_up": ["[sighing] I'm not sure what you mean. Try saying it differently?"],
     "unsupported": ["[chuckling] I know what you want, I just can't do that one yet."],
@@ -207,7 +213,7 @@ def ask_llm(text):
                       headers={"Authorization": f"Bearer {OR_KEY}"},
                       json={"model": LLM_MODEL, "max_tokens": 80, "usage": {"include": True},
                             "messages": [{"role": "system", "content": "You are a voice assistant. Answer in one short spoken sentence, no markdown. "
-                                          "You may start with exactly one tag from: [chuckling] [sighing] [cheerful] [whispering], or none."},
+                                          "You may start with exactly one tag from: [chuckling] [laughing] [sighing] [cheerful], or none."},
                                          {"role": "user", "content": text}]}, timeout=30)
     r.raise_for_status()
     j = r.json()
@@ -398,14 +404,45 @@ def say(line, notify):
 
 # --------------------------------------------------------------------------- Mic + push to talk
 class Recorder:
+    BLOCK = 1600  # 100ms at 16kHz
+
     def __init__(self):
         self.frames, self.on = [], False
-        self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=self._cb)
+        self.wake, self.paused = False, False
+        self.segments = queue.Queue()
+        self.noise = 0.005
+        self._reset_segment()
+        self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                                     blocksize=self.BLOCK, callback=self._cb)
         self.stream.start()
+
+    def _reset_segment(self):
+        self.speech, self.silent = [], 0
+        self.preroll = collections.deque(maxlen=3)
 
     def _cb(self, indata, *_):
         if self.on:
             self.frames.append(indata.copy())
+        if not self.wake or self.paused:
+            if self.speech:
+                self._reset_segment()
+            return
+        block = indata[:, 0].copy()
+        rms = float(np.sqrt(np.mean(block ** 2)))
+        loud = rms > max(self.noise * 3, 0.01)
+        if not self.speech:
+            if loud:
+                self.speech, self.silent = list(self.preroll) + [block], 0
+            else:
+                self.noise = 0.95 * self.noise + 0.05 * rms  # track the room's background level
+                self.preroll.append(block)
+            return
+        self.speech.append(block)
+        self.silent = 0 if loud else self.silent + 1
+        if self.silent >= 8 or len(self.speech) >= 150:  # 0.8s pause ends a phrase, 15s max
+            if len(self.speech) - self.silent >= 4:
+                self.segments.put(np.concatenate(self.speech))
+            self._reset_segment()
 
     def start(self):
         self.frames, self.on = [], True
@@ -415,48 +452,118 @@ class Recorder:
         return np.concatenate(self.frames)[:, 0] if self.frames else np.zeros(0, dtype="float32")
 
 
-def run_voice_assistant(notify=None, controls=None):
+def ready_text(wake):
+    return "Say \u201cHey Jev\u201d and your command" if wake else "Ready when you are"
+
+
+def run_voice_assistant(notify=None, controls=None, mode="ptt"):
     from faster_whisper import WhisperModel
     print("loading whisper...")
-    emit(notify, "Starting", "Loading Whisper…")
+    emit(notify, "Starting", "Loading Whisper\u2026")
     model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     rec = Recorder()
     busy = threading.Lock()
+    armed_until = [0.0]
 
-    def turn(audio):
+    def transcribe(audio, prompt):
+        t = time.time()
+        segs, _ = model.transcribe(audio, language="en", beam_size=1, vad_filter=True, initial_prompt=prompt)
+        return " ".join(s.text.strip() for s in segs).strip(), int((time.time() - t) * 1000)
+
+    def run_turn(text, stt_ms):
         with busy:
+            rec.paused = True  # don't hear her own reply
             try:
-                emit(notify, "Transcribing", "Working out what you said…")
-                t = time.time()
-                segs, _ = model.transcribe(audio, language="en", beam_size=1, vad_filter=True,
-                                           initial_prompt="Open Spotify. Play. Pause. Next track. Turn Spotify down. Turn the Mac volume down. Mute. Dark mode on. Lock the screen.")
-                text = " ".join(s.text.strip() for s in segs)
-                handle(text, int((time.time() - t) * 1000), notify)
+                handle(text, stt_ms, notify)
             except Exception as exc:
                 print(f"\n  turn failed: {exc}")
                 emit(notify, "Something went wrong", str(exc))
                 time.sleep(2)
-                emit(notify, "Ready", "Ready when you are")
+                emit(notify, "Ready", ready_text(rec.wake))
+            finally:
+                time.sleep(0.3)
+                rec.paused = False
+
+    def ptt_turn(audio):
+        emit(notify, "Transcribing", "Working out what you said\u2026")
+        try:
+            text, ms = transcribe(audio, COMMAND_PROMPT)
+        except Exception as exc:
+            emit(notify, "Something went wrong", str(exc))
+            return
+        run_turn(text, ms)
+
+    def wake_loop():
+        while True:
+            try:
+                audio = rec.segments.get(timeout=1)
+            except queue.Empty:
+                if armed_until[0] and time.time() > armed_until[0]:
+                    armed_until[0] = 0
+                    emit(notify, "Ready", ready_text(rec.wake))
+                continue
+            if not rec.wake or busy.locked():
+                continue
+            try:
+                text, ms = transcribe(audio, WAKE_PROMPT)
+            except Exception as exc:
+                print(f"\n  transcribe failed: {exc}")
+                continue
+            m = WAKE.match(text)
+            if m:
+                rest = text[m.end():].strip(" .,!?")
+                if rest:
+                    armed_until[0] = 0
+                    run_turn(rest, ms)
+                else:
+                    with busy:
+                        rec.paused = True
+                        say(say_line("wake"), notify)
+                        time.sleep(0.2)
+                        rec.paused = False
+                    armed_until[0] = time.time() + WAKE_WINDOW
+                    emit(notify, "Listening", "Go ahead\u2026")
+            elif armed_until[0] and time.time() < armed_until[0]:
+                armed_until[0] = 0
+                run_turn(text, ms)
+            elif text:
+                print(f"\n  (not for me: {text!r})")
+
+    def set_mode(new):
+        rec.wake = new == "wake"
+        armed_until[0] = 0
+        print(f"\n[mode: {'always listening' if rec.wake else 'hold right Option'}]")
+        if not busy.locked():
+            emit(notify, "Ready", ready_text(rec.wake))
 
     def start_recording():
-        if not rec.on and not busy.locked():
+        if not rec.wake and not rec.on and not busy.locked():
             rec.start()
             print("\n[listening]", end="", flush=True)
-            emit(notify, "Listening", "Release right Option when you’re done")
+            emit(notify, "Listening", "Release right Option when you\u2019re done")
 
     def stop_recording():
         if rec.on:
             audio = rec.stop()
             if len(audio) > SAMPLE_RATE * 0.3:
-                threading.Thread(target=turn, args=(audio,), daemon=True).start()
+                threading.Thread(target=ptt_turn, args=(audio,), daemon=True).start()
 
     threading.Thread(target=warm_cache, daemon=True).start()
-    print("ready. hold right Option and talk. ctrl+c to quit.")
-    emit(notify, "Ready", "Ready when you are")
+    threading.Thread(target=wake_loop, daemon=True).start()
+    set_mode(mode)
+    print("ready. ctrl+c to quit.")
     if controls is not None:
         while True:
             command = controls.get()
-            start_recording() if command == "press" else stop_recording()
+            if isinstance(command, tuple) and command[0] == "mode":
+                set_mode(command[1])
+            elif command == "press":
+                start_recording()
+            elif command == "release":
+                stop_recording()
+
+    if rec.wake:
+        threading.Event().wait()
 
     def on_press(key):
         if key == PTT_KEY:
@@ -474,6 +581,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--text", help="skip the mic, run one turn on this transcript")
     ap.add_argument("--ui", action="store_true", help="show the native floating status window")
+    ap.add_argument("--wake", action="store_true", help="always listening, say \"Hey Jev\" instead of holding Option")
     args = ap.parse_args()
     if args.ui:
         from assistant_ui import run_app
@@ -484,7 +592,7 @@ def main():
     if args.text:
         handle(args.text)
         return
-    run_voice_assistant()
+    run_voice_assistant(mode="wake" if args.wake else "ptt")
 
 
 if __name__ == "__main__":

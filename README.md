@@ -1,6 +1,6 @@
 # Hey Jev
 
-A push to talk voice assistant for your Mac. Hold right Option, say a thing, it does it and answers back.
+A voice assistant for your Mac. Say "Hey Jev" or hold right Option, say a thing, it does it and answers back.
 
 - **Jev** (TypeSafe) makes every decision in one call, $0.00004 per request
 - **Fish Audio S2.1 Pro** speaks every reply, with emotion tags like `[chuckling]` and `[sighing]`
@@ -44,7 +44,10 @@ First launch:
 4. Add "Hey Jev - Fish Audio" (or your terminal, if you run from the terminal) under **System Settings > Privacy & Security > Accessibility**, or key presses are ignored.
 5. The first time it quits an app or toggles dark mode you'll get an **Automation** prompt. Say yes.
 
-The window goes green when it's ready. Hold right Option, talk, let go.
+The window goes green when it's ready. The switch in the bottom right picks how you talk to it:
+
+- **Hold Option:** hold right Option, talk, let go.
+- **Hey Jev:** always listening. Say "Hey Jev, open Spotify" in one go, or say "Hey Jev", wait for her reply, then give the command.
 
 ### Or let Claude Code set it up
 
@@ -68,7 +71,7 @@ Keys can also go in a `.env` file (`TYPESAFE_API_KEY`, `FISH_AUDIO_API_KEY`, `OP
 
 ## How it works
 
-1. Hold right Option, audio is recorded until you let go.
+1. Audio is recorded while you hold right Option. In Hey Jev mode the mic stays open, and each phrase is transcribed locally and only acted on if it starts with "Hey Jev".
 2. faster-whisper transcribes it locally for free, about 0.8s.
 3. One Jev call asks every question at once (category, is it compound, target, which app, which action, volume level, and so on). The code ignores the answers that don't apply. This is the speculative fan-out pattern from the TypeSafe docs.
 4. If Jev says the request is two things, a second Jev call asks the same questions twice, scoped to "the first action" and "the second action". No LLM needed to split.

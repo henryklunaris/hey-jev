@@ -18,8 +18,9 @@ from AppKit import (
     NSFont,
     NSMakePoint,
     NSMakeRect,
-    NSPanel,
     NSScreen,
+    NSSegmentedControl,
+    NSWindow,
     NSSecureTextField,
     NSTextField,
     NSVisualEffectBlendingModeBehindWindow,
@@ -27,12 +28,17 @@ from AppKit import (
     NSVisualEffectStateActive,
     NSVisualEffectView,
     NSWindowStyleMaskClosable,
+    NSWindowStyleMaskMiniaturizable,
     NSWindowStyleMaskFullSizeContentView,
     NSWindowStyleMaskTitled,
 )
-from Foundation import NSObject
+from Foundation import NSObject, NSUserDefaults
 from secrets_store import KEY_NAMES, get_secret, missing_secrets, save_secret
 
+
+NORMAL, FLOATING = 0, 3  # NSNormalWindowLevel, NSFloatingWindowLevel
+HINTS = {"ptt": "Hold right Option to talk", "wake": "Say \u201cHey Jev\u201d, then your command"}
+MODES = ("ptt", "wake")
 
 STATUS_COLORS = {
     "Starting": NSColor.systemOrangeColor(),
@@ -60,15 +66,21 @@ class AppDelegate(NSObject):
         self.controls = queue.Queue()
         self.option_down = False
         self.worker_started = False
-        style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskFullSizeContentView
-        self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+        self.mode = NSUserDefaults.standardUserDefaults().stringForKey_("mode") or "ptt"
+        if self.mode not in MODES:
+            self.mode = "ptt"
+        style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable
+                 | NSWindowStyleMaskFullSizeContentView)
+        self.panel = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, 420, 154), style, NSBackingStoreBuffered, False
         )
         self.panel.setTitle_("Hey Jev - Fish Audio")
         self.panel.setTitlebarAppearsTransparent_(True)
         self.panel.setMovableByWindowBackground_(True)
-        self.panel.setFloatingPanel_(True)
-        self.panel.setHidesOnDeactivate_(False)
+        self.panel.setReleasedWhenClosed_(False)  # closing just hides it, the Dock icon brings it back
+        self.on_top = NSUserDefaults.standardUserDefaults().boolForKey_("keep_on_top")
+        self.panel.setLevel_(FLOATING if self.on_top else NORMAL)
+        self._add_window_menu()
 
         background = NSVisualEffectView.alloc().initWithFrame_(NSMakeRect(0, 0, 420, 154))
         background.setMaterial_(NSVisualEffectMaterialHUDWindow)
@@ -79,7 +91,7 @@ class AppDelegate(NSObject):
         self.dot = label("●", NSMakeRect(25, 76, 24, 30), 18, NSColor.systemOrangeColor())
         self.status = label("Starting", NSMakeRect(55, 78, 330, 30), 22)
         self.detail = label("Loading Whisper…", NSMakeRect(27, 39, 365, 30), 14, NSColor.secondaryLabelColor())
-        self.hint = label("Hold right Option to talk", NSMakeRect(27, 14, 365, 22), 12, NSColor.tertiaryLabelColor())
+        self.hint = label(HINTS[self.mode], NSMakeRect(27, 14, 220, 22), 12, NSColor.tertiaryLabelColor())
         for view in (self.dot, self.status, self.detail, self.hint):
             background.addSubview_(view)
 
@@ -89,6 +101,15 @@ class AppDelegate(NSObject):
         settings.setControlSize_(1)  # small
         settings.setFont_(NSFont.systemFontOfSize_(11))
         background.addSubview_(settings)
+
+        self.mode_switch = NSSegmentedControl.segmentedControlWithLabels_trackingMode_target_action_(
+            ["Hold Option", "Hey Jev"], 0, self, "modeChanged:"
+        )
+        self.mode_switch.setControlSize_(1)
+        self.mode_switch.setFont_(NSFont.systemFontOfSize_(11))
+        self.mode_switch.setFrame_(NSMakeRect(252, 12, 156, 24))
+        self.mode_switch.setSelectedSegment_(MODES.index(self.mode))
+        background.addSubview_(self.mode_switch)
 
         screen = NSScreen.mainScreen().visibleFrame()
         self.panel.setFrameOrigin_(NSMakePoint(screen.origin.x + (screen.size.width - 420) / 2,
@@ -103,7 +124,7 @@ class AppDelegate(NSObject):
         )
         if missing_secrets():
             self.updateStatus_({"state": "Starting", "detail": "Add your API keys to begin"})
-            self.showSettings_(None)
+            self.performSelector_withObject_afterDelay_("showSettings:", None, 0.3)
         else:
             self._start_worker()
 
@@ -136,9 +157,43 @@ class AppDelegate(NSObject):
     def _run_assistant(self):
         from siri import run_voice_assistant
         try:
-            run_voice_assistant(self.notify, self.controls)
+            run_voice_assistant(self.notify, self.controls, self.mode)
         except Exception as exc:
             self.notify("Something went wrong", str(exc))
+
+    @objc.python_method
+    def _add_window_menu(self):
+        item = NSMenuItem.alloc().init()
+        NSApp.mainMenu().addItem_(item)
+        menu = NSMenu.alloc().initWithTitle_("Window")
+        menu.addItemWithTitle_action_keyEquivalent_("Minimize", "performMiniaturize:", "m")
+        self.on_top_item = menu.addItemWithTitle_action_keyEquivalent_("Keep on Top", "toggleOnTop:", "t")
+        self.on_top_item.setTarget_(self)
+        self.on_top_item.setState_(1 if self.on_top else 0)
+        menu.addItemWithTitle_action_keyEquivalent_("Show Hey Jev", "showMain:", "1").setTarget_(self)
+        item.setSubmenu_(menu)
+        NSApp.setWindowsMenu_(menu)
+
+    def toggleOnTop_(self, _sender):
+        self.on_top = not self.on_top
+        NSUserDefaults.standardUserDefaults().setBool_forKey_(self.on_top, "keep_on_top")
+        self.panel.setLevel_(FLOATING if self.on_top else NORMAL)
+        self.on_top_item.setState_(1 if self.on_top else 0)
+
+    def showMain_(self, _sender):
+        self.panel.deminiaturize_(None)
+        self.panel.makeKeyAndOrderFront_(None)
+        NSApp.activateIgnoringOtherApps_(True)
+
+    def applicationShouldHandleReopen_hasVisibleWindows_(self, _app, _visible):
+        self.showMain_(None)
+        return True
+
+    def modeChanged_(self, sender):
+        self.mode = MODES[sender.selectedSegment()]
+        NSUserDefaults.standardUserDefaults().setObject_forKey_(self.mode, "mode")
+        self.hint.setStringValue_(HINTS[self.mode])
+        self.controls.put(("mode", self.mode))
 
     def showSettings_(self, _sender):
         try:
@@ -148,19 +203,15 @@ class AppDelegate(NSObject):
 
     @objc.python_method
     def _show_settings(self):
-        if getattr(self, "settings_panel", None):
-            self.settings_panel.makeKeyAndOrderFront_(None)
+        if getattr(self, "settings_sheet", None):
             return
-
-        self.settings_panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(0, 0, 460, 305), NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
-            NSBackingStoreBuffered, False
+        sheet = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, 400, 250), NSWindowStyleMaskTitled, NSBackingStoreBuffered, False
         )
-        self.settings_panel.setTitle_("Hey Jev Keys")
-        content = self.settings_panel.contentView()
-        content.addSubview_(label("API keys", NSMakeRect(24, 245, 400, 32), 24))
+        content = sheet.contentView()
+        content.addSubview_(label("API keys", NSMakeRect(22, 204, 360, 30), 20))
         content.addSubview_(label("Saved in your Mac Keychain. Existing keys stay hidden.",
-                                  NSMakeRect(25, 218, 410, 22), 13, NSColor.secondaryLabelColor()))
+                                  NSMakeRect(23, 182, 360, 20), 12, NSColor.secondaryLabelColor()))
 
         field_names = (
             ("TypeSafe", "TYPESAFE_API_KEY"),
@@ -169,24 +220,38 @@ class AppDelegate(NSObject):
         )
         self.key_fields = {}
         for index, (title, key_name) in enumerate(field_names):
-            y = 169 - index * 54
-            content.addSubview_(label(title, NSMakeRect(25, y + 3, 92, 24), 13))
-            field = NSSecureTextField.alloc().initWithFrame_(NSMakeRect(119, y, 315, 28))
-            field.setBezelStyle_(1)  # rounded, like a search field
-            field.setFocusRingType_(1)  # no square focus ring around the rounded field
+            y = 136 - index * 40
+            content.addSubview_(label(title, NSMakeRect(23, y + 3, 84, 22), 13))
+            field = NSSecureTextField.alloc().initWithFrame_(NSMakeRect(108, y, 270, 26))
+            field.setBezelStyle_(1)  # rounded
+            field.setFocusRingType_(1)
             field.setPlaceholderString_("Already configured" if get_secret(key_name) else "Paste key")
             content.addSubview_(field)
             self.key_fields[key_name] = field
 
-        self.settings_message = label("", NSMakeRect(25, 22, 290, 22), 12, NSColor.systemRedColor())
+        self.settings_message = label("", NSMakeRect(23, 20, 180, 20), 11, NSColor.systemRedColor())
         content.addSubview_(self.settings_message)
         save = NSButton.buttonWithTitle_target_action_("Save", self, "saveSettings:")
-        save.setFrame_(NSMakeRect(344, 15, 90, 32))
+        save.setFrame_(NSMakeRect(298, 12, 82, 32))
         save.setKeyEquivalent_("\r")
         content.addSubview_(save)
-        self.settings_panel.center()
-        self.settings_panel.makeKeyAndOrderFront_(None)
+        if not missing_secrets():
+            cancel = NSButton.buttonWithTitle_target_action_("Cancel", self, "closeSettings:")
+            cancel.setFrame_(NSMakeRect(210, 12, 86, 32))
+            cancel.setKeyEquivalent_("\x1b")
+            content.addSubview_(cancel)
+
+        self.settings_sheet = sheet
         NSApp.activateIgnoringOtherApps_(True)
+        self.panel.makeKeyAndOrderFront_(None)
+        self.panel.beginSheet_completionHandler_(sheet, None)
+        sheet.makeFirstResponder_(self.key_fields["TYPESAFE_API_KEY"])
+
+    def closeSettings_(self, _sender):
+        if getattr(self, "settings_sheet", None):
+            self.panel.endSheet_(self.settings_sheet)
+            self.settings_sheet.orderOut_(None)
+            self.settings_sheet = None
 
     def saveSettings_(self, _sender):
         try:
@@ -201,8 +266,7 @@ class AppDelegate(NSObject):
                 return
             from siri import reload_keys
             reload_keys()
-            self.settings_panel.orderOut_(None)
-            self.settings_panel = None
+            self.closeSettings_(None)
             self._start_worker()
         except Exception as exc:
             self.settings_message.setStringValue_(str(exc))
@@ -221,7 +285,7 @@ class AppDelegate(NSObject):
         self.dot.setTextColor_(STATUS_COLORS.get(state, NSColor.labelColor()))
 
     def applicationShouldTerminateAfterLastWindowClosed_(self, _application):
-        return False  # both windows are NSPanels, which AppKit doesn't count, so closing Keys would quit the app
+        return False  # keep listening with the window closed, the Dock icon reopens it
 
     def applicationWillTerminate_(self, _notification):
         if getattr(self, "global_monitor", None):

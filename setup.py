@@ -8,6 +8,7 @@ setup(
     app=["app.py"],
     options={"py2app": {
         "argv_emulation": False,
+        "iconfile": "assets/icon.icns",
         "plist": {
             "CFBundleName": APP_NAME,
             "CFBundleDisplayName": APP_NAME,
@@ -15,7 +16,7 @@ setup(
             "CFBundleShortVersionString": "0.2",
             "LSUIElement": False,
             "NSHighResolutionCapable": True,
-            "NSMicrophoneUsageDescription": "Hey Jev listens while you hold right Option.",
+            "NSMicrophoneUsageDescription": "Hey Jev listens for your commands.",
             "NSAppleEventsUsageDescription": "Hey Jev controls Spotify, volume and dark mode for you.",
         },
     }},
