@@ -1,5 +1,5 @@
 """Mac voice assistant: hold right Option or say "Hey Jev", then speak. Jev decides, Fish speaks."""
-import os, re, sys, time, queue, random, argparse, subprocess, tempfile, threading, hashlib, collections
+import os, re, sys, json, time, queue, random, argparse, subprocess, tempfile, threading, hashlib, collections
 import numpy as np, requests, sounddevice as sd, soundfile as sf
 from dotenv import load_dotenv
 from pynput import keyboard
@@ -14,7 +14,7 @@ PTT_KEY = keyboard.Key.alt_r
 SAMPLE_RATE = 16000
 GATE = 0.65
 WHISPER_MODEL = "small.en"
-COMMAND_PROMPT = "Open Spotify. Play. Pause. Next track. Turn Spotify down. Turn the Mac volume down. Mute. Dark mode on. Lock the screen."
+COMMAND_PROMPT = "Open Spotify. Set a timer for five minutes. Play. Pause. Next track. Turn Spotify down. Turn the Mac volume down. Mute. Dark mode on. Lock the screen."
 WAKE_PROMPT = "Hey Jev, open Spotify. Hey Jev, pause the music. Hey Jev, turn the volume down."
 # Whisper often hears "Jev" as Jeff or Jeb, so accept the close ones
 WAKE = re.compile(r"^\W*(?:hey|hi|hay|okay|ok|a)\W+(?:jev|jevs|jeff|jeffs|jef|jeb|jab|chev|jeve|jav)\b\W*", re.I)
@@ -37,7 +37,8 @@ QUESTIONS = {
     "compound": {"type": "noul", "instructions": "Does the request contain more than one distinct action?"},
     "target": {"type": "choice", "instructions": "What is the primary thing being controlled?",
                "criteria": {"app": "an application", "volume": "sound level", "display": "screen appearance or dark mode",
-                            "media": "music playback", "system": "locking or sleeping the computer"}},
+                            "media": "music playback", "system": "locking or sleeping the computer",
+                            "timer": "setting, checking, or cancelling a timer or reminder"}},
     "app": {"type": "choice", "instructions": "Which app, if any, is named?",
             "criteria": {"spotify": None, "slack": None, "chrome": None, "vscode": None, "finder": None,
                          "safari": None, "messages": None, "notes": None, "none": None}},
@@ -56,6 +57,9 @@ QUESTIONS = {
                        "criteria": {"dark_on": None, "dark_off": None, "toggle": None, "none": None}},
     "media_action": {"type": "choice", "instructions": "What should happen to music playback?",
                      "criteria": {"play": None, "pause": None, "next": None, "previous": None, "none": None}},
+    "timer_action": {"type": "choice", "instructions": "What should happen with a timer or reminder?",
+                     "criteria": {"set": "start a timer or set a reminder", "check": "ask how much time is left",
+                                  "cancel": "stop or cancel a timer", "none": None}},
     "system_action": {"type": "choice", "instructions": "What should happen to the computer?",
                       "criteria": {"lock": None, "sleep": None, "none": None}},
 }
@@ -192,15 +196,182 @@ REPLIES = {
     "wake": ["Yes?", "[cheerful] Mm-hm?", "I'm listening."],
     "clarify": ["[clear throat] Sorry, say that again?", "Hm, one more time?"],
     "give_up": ["[sighing] I'm not sure what you mean. Try saying it differently?"],
+    "timer_set": ["[cheerful] Timer's set.", "On it. I'll let you know.", "Done, counting down."],
+    "reminder_set": ["Got it, I'll remind you.", "[cheerful] Sure, I'll give you a shout."],
+    "timer_check": ["{left} left.", "You've got {left} to go."],
+    "timer_cancel": ["Timer cancelled.", "[sighing] Fine, no timer then."],
+    "timers_cancel": ["All timers cancelled.", "Cleared them all."],
+    "timer_none": ["[chuckling] There's no timer running."],
+    "timer_unclear": ["[clear throat] How long for?"],
+    "timer_done": ["[cheerful] Time's up!", "[chuckling] Ding ding, time's up."],
+    "reminder_done": ["[cheerful] Hey, just a reminder: {label}.", "Reminder: {label}."],
     "unsupported": ["[chuckling] I know what you want, I just can't do that one yet."],
 }
 
 
+TARGETS = ("app", "volume", "display", "media", "system", "timer")
 SPEAK_FIRST = {"volume_mute", "system_lock", "system_sleep"}
 
 
 def say_line(key, **fmt):
     return random.choice(REPLIES[key]).format(**fmt)
+
+
+# --------------------------------------------------------------------------- Timers and reminders
+NUMBER_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+                "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+                "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+                "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "ninety": 90, "couple": 2, "few": 3}
+UNITS = {"s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1, "m": 60, "min": 60, "mins": 60,
+         "minute": 60, "minutes": 60, "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600}
+DURATION = re.compile(r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b(\s+and\s+a\s+half)?")
+
+
+def _digits(text):
+    """'twenty five minutes' -> '25 minutes', 'half an hour' -> '30 minutes'."""
+    t = re.sub(r"\bhalf an? hour\b", "30 minutes", text.lower())
+    t = re.sub(r"\ba couple of\b", "couple", t)
+    t = re.sub(r"\b(an?|few|couple)\s+(hours?|minutes?|seconds?)\b", lambda m: f"{NUMBER_WORDS[m[1]]} {m[2]}", t)
+    words = t.replace("-", " ").split()
+    out, i = [], 0
+    while i < len(words):
+        w = words[i].strip(",.!?")
+        if w in NUMBER_WORDS and w not in ("a", "an", "few", "couple"):
+            n = NUMBER_WORDS[w]
+            nxt = words[i + 1].strip(",.!?") if i + 1 < len(words) else ""
+            if n >= 20 and nxt in NUMBER_WORDS and NUMBER_WORDS[nxt] < 10 and nxt not in ("a", "an"):
+                n, i = n + NUMBER_WORDS[nxt], i + 1
+            out.append(str(n))
+        else:
+            out.append(words[i])
+        i += 1
+    return " ".join(out)
+
+
+def parse_duration(text):
+    """Total seconds mentioned in the sentence, or None."""
+    total = 0
+    for num, unit, half in DURATION.findall(_digits(text)):
+        secs = UNITS[unit]
+        total += float(num) * secs + (secs / 2 if half else 0)
+    return int(total) or None
+
+
+def parse_reminder(text):
+    """What to remind about: the part after 'to', minus any duration. 'remind me in 5 min to call mum' -> 'call mum'."""
+    m = re.search(r"\bto\s+(.+)$", _digits(text))
+    if not m:
+        return None
+    what = DURATION.sub("", m[1])
+    what = re.sub(r"\bplease\b", "", what).strip(" .,!?")
+    what = re.sub(r"\s*\b(in|for|after)$", "", what).strip(" .,!?")
+    return what or None
+
+
+def say_duration(secs):
+    secs = max(0, int(round(secs)))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    parts = [f"{n} {u}{'' if n == 1 else 's'}" for n, u in ((h, "hour"), (m, "minute"), (s, "second")) if n]
+    if h or m >= 10:  # skip seconds once it's a long wait
+        parts = parts[:2] if h else parts[:1]
+    return " and ".join(parts) or "no time"
+
+
+TIMERS, TIMERS_LOCK = [], threading.Lock()
+
+
+def add_timer(secs, label=None):
+    t = {"end": time.time() + secs, "secs": secs, "label": label, "line": None}
+    with TIMERS_LOCK:
+        TIMERS.append(t)
+        TIMERS.sort(key=lambda x: x["end"])
+    return t
+
+
+def prepare_reminder(t, said):
+    """While the timer runs, have the LLM write the alert and a short name, and render the audio, so it plays instantly."""
+    try:
+        r = requests.post("https://openrouter.ai/api/v1/chat/completions",
+                          headers={"Authorization": f"Bearer {OR_KEY}"},
+                          json={"model": LLM_MODEL, "max_tokens": 120, "response_format": {"type": "json_object"},
+                                "messages": [{"role": "system", "content":
+                                    "The user set a reminder with a voice assistant. Reply with JSON only: "
+                                    '{"label": "2 to 4 word name for the task, e.g. Call Sam", '
+                                    '"alert": "one short friendly sentence the assistant says out loud when the time is up, '
+                                    'speaking to the user, e.g. Hey, it\'s time to give Sam a call."}. '
+                                    "The alert may start with one tag from [cheerful] [chuckling] [sighing], or none. No markdown."},
+                                    {"role": "user", "content": said}]}, timeout=30)
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"]
+        data = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
+        t["label"] = data.get("label") or t["label"]
+        fetch_tts(data["alert"])  # cache the audio now
+        t["line"] = data["alert"]
+        print(f"\n  reminder ready: {t['label']!r} -> {t['line']!r}")
+    except Exception as e:
+        print(f"\n  reminder prep failed, using the plain line: {e}")
+
+
+def timer_snapshot():
+    """(name, seconds left) for each running timer, soonest first."""
+    now = time.time()
+    with TIMERS_LOCK:
+        return [((t["label"] or "").capitalize() or short_duration(t["secs"]) + " timer", max(0, t["end"] - now))
+                for t in TIMERS]
+
+
+def short_duration(secs):
+    h, rem = divmod(int(secs), 3600)
+    m, s = divmod(rem, 60)
+    return " ".join(f"{n} {u}" for n, u in ((h, "hr"), (m, "min"), (s, "sec")) if n) or "0 sec"
+
+
+def run_timer(action, text):
+    """Returns (reply_key, fmt)."""
+    if action == "timer_set":
+        secs = parse_duration(text)
+        if not secs:
+            return ("timer_unclear", {})
+        label = parse_reminder(text)
+        t = add_timer(secs, label)
+        if label and OR_KEY:
+            threading.Thread(target=prepare_reminder, args=(t, text), daemon=True).start()
+        print(f"  timer: {secs}s" + (f" -> {label!r}" if label else ""))
+        return ("reminder_set" if label else "timer_set", {})
+    with TIMERS_LOCK:
+        if not TIMERS:
+            return ("timer_none", {})
+        if action == "timer_check":
+            return ("timer_check", {"left": say_duration(TIMERS[0]["end"] - time.time())})
+        if re.search(r"\ball\b", text.lower()):
+            TIMERS.clear()
+            return ("timers_cancel", {})
+        TIMERS.remove(max(TIMERS, key=lambda t: t["end"] - t["secs"]))  # the one set most recently
+        return ("timer_cancel", {})
+
+
+def start_timer_loop(on_done):
+    """Fires on_done(timer) when a timer runs out."""
+    def loop():
+        while True:
+            time.sleep(0.25)
+            with TIMERS_LOCK:
+                due = [t for t in TIMERS if t["end"] <= time.time()]
+                for t in due:
+                    TIMERS.remove(t)
+            for t in due:
+                try:
+                    on_done(t)
+                except Exception as e:
+                    print(f"  timer alert failed: {e}")
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def timer_done_line(t):
+    if t["line"]:
+        return t["line"]
+    return say_line("reminder_done", label=t["label"]) if t["label"] else say_line("timer_done")
 
 
 # --------------------------------------------------------------------------- LLM fallback (questions only)
@@ -228,7 +399,8 @@ def sub_action(ans, target):
         if app == "none" or action == "none" or min(ac, aac) < GATE:
             return None
         return (min(ac, aac), f"app_{action}", app, f"app_{action}", {"app": APPS[app]})
-    key = {"volume": "volume_action", "display": "display_action", "media": "media_action", "system": "system_action"}[target]
+    key = {"volume": "volume_action", "display": "display_action", "media": "media_action",
+           "system": "system_action", "timer": "timer_action"}[target]
     action, conf = ans[key]
     if action == "none" or conf < GATE:
         return None
@@ -245,6 +417,10 @@ def sub_action(ans, target):
 def decide(ans):
     """Read the Jev fan-out. Returns ("actions", [...]), ("reply", key), ("llm", None) or ("clarify", None)."""
     cat, cconf = ans["category"]
+    if ans["target"][0] == "timer" and ans["target"][1] >= GATE and not ans["compound"][0]:
+        t = sub_action(ans, "timer")  # "how long is left?" reads like a question but it's a timer command
+        if t:
+            return ("actions", [t])
     if cat == "chit_chat" and cconf >= GATE:
         return ("reply", "chit_chat")
     if cat == "information_request" and cconf >= GATE:
@@ -264,7 +440,7 @@ def pick_action(ans):
     target, tconf = ans["target"]
     a = sub_action(ans, target) if tconf >= 0.5 else None
     if a is None:
-        cands = [x for x in (sub_action(ans, t) for t in ("app", "volume", "display", "media", "system")) if x]
+        cands = [x for x in (sub_action(ans, t) for t in TARGETS) if x]
         a = max(cands, key=lambda x: x[0]) if cands else None
     return a
 
@@ -281,7 +457,7 @@ def split_actions(text, ans):
         if a and (a[1], a[2]) not in [(x[1], x[2]) for x in acts]:
             acts.append(a)
     if len(acts) < 2:  # split didn't separate them, fall back to whatever the first fan-out was sure about
-        acts = [a for a in (sub_action(ans, t) for t in ("app", "volume", "display", "media", "system")) if a]
+        acts = [a for a in (sub_action(ans, t) for t in TARGETS) if a]
     return acts
 
 
@@ -317,7 +493,7 @@ def all_scripted_lines():
                 yield from (line.format(app=a) for a in APPS.values())
             elif "{level}" in line:
                 yield from (line.format(level=l) for l in LEVELS)
-            else:
+            elif "{" not in line:  # lines with a live value like {left} are generated when needed
                 yield line
 
 
@@ -372,16 +548,20 @@ def handle(text, stt_ms=None, notify=None):
             line, llm_ms, llm_cost = ask_llm(text)
             print(f"  llm {LLM_MODEL} {llm_ms}ms  ${llm_cost}")
         else:
-            line = say_line(payload[0][3], **payload[0][4]) if len(payload) == 1 else say_line("compound_done")
+            default_line = lambda: say_line(payload[0][3], **payload[0][4]) if len(payload) == 1 else say_line("compound_done")
             # anything that kills the sound or the screen gets the reply first, or she'd mute herself
             speak_first = any(a[1] in SPEAK_FIRST or (a[1].endswith("volume_set") and a[2] == "silent") for a in payload)
             if speak_first:
+                line = default_line()
                 say(line, notify)
-            done = 0
+            done, timer_reply = 0, None
             for _, action, arg, _, _ in payload:
                 try:
                     emit(notify, "Doing it", text)
-                    ACTIONS[action](arg)
+                    if action.startswith("timer_"):
+                        timer_reply = run_timer(action, text)
+                    else:
+                        ACTIONS[action](arg)
                     print(f"  action: {action} {arg or ''}")
                     done += 1
                 except Exception as e:
@@ -391,6 +571,10 @@ def handle(text, stt_ms=None, notify=None):
                 return
             if not done:
                 line = say_line("unsupported")
+            elif timer_reply and len(payload) == 1:
+                line = say_line(timer_reply[0], **timer_reply[1])
+            else:
+                line = default_line()
     say(line, notify)
     emit(notify, "Ready", line)
 
@@ -548,6 +732,19 @@ def run_voice_assistant(notify=None, controls=None, mode="ptt"):
             if len(audio) > SAMPLE_RATE * 0.3:
                 threading.Thread(target=ptt_turn, args=(audio,), daemon=True).start()
 
+    def timer_done(t):
+        with busy:
+            rec.paused = True
+            try:
+                emit(notify, "Time's up", t["label"] or "Timer finished")
+                subprocess.run(["afplay", "/System/Library/Sounds/Glass.aiff"])
+                say(timer_done_line(t), notify)
+            finally:
+                time.sleep(0.3)
+                rec.paused = False
+        emit(notify, "Ready", ready_text(rec.wake))
+
+    start_timer_loop(timer_done)
     threading.Thread(target=warm_cache, daemon=True).start()
     threading.Thread(target=wake_loop, daemon=True).start()
     set_mode(mode)

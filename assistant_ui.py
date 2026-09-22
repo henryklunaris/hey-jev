@@ -1,5 +1,6 @@
 """Small native macOS status window for the Jev voice assistant."""
 import queue
+import sys
 import threading
 
 import objc
@@ -32,10 +33,12 @@ from AppKit import (
     NSWindowStyleMaskFullSizeContentView,
     NSWindowStyleMaskTitled,
 )
-from Foundation import NSObject, NSUserDefaults
+from Foundation import NSObject, NSTimer, NSUserDefaults
 from secrets_store import KEY_NAMES, get_secret, missing_secrets, save_secret
 
 
+BASE_HEIGHT, ROW = 154, 24
+STICK_TOP, STICK_BOTTOM = 8, 32  # NSViewMinYMargin, NSViewMaxYMargin
 NORMAL, FLOATING = 0, 3  # NSNormalWindowLevel, NSFloatingWindowLevel
 HINTS = {"ptt": "Hold right Option to talk", "wake": "Say \u201cHey Jev\u201d, then your command"}
 MODES = ("ptt", "wake")
@@ -49,6 +52,7 @@ STATUS_COLORS = {
     "Doing it": NSColor.systemOrangeColor(),
     "Speaking": NSColor.systemTealColor(),
     "Something went wrong": NSColor.systemRedColor(),
+    "Time's up": NSColor.systemYellowColor(),
 }
 
 
@@ -86,7 +90,10 @@ class AppDelegate(NSObject):
         background.setMaterial_(NSVisualEffectMaterialHUDWindow)
         background.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
         background.setState_(NSVisualEffectStateActive)
+        background.setAutoresizingMask_(18)  # grow with the window
         self.panel.setContentView_(background)
+        self.background = background
+        self.timer_rows = []
 
         self.dot = label("●", NSMakeRect(25, 76, 24, 30), 18, NSColor.systemOrangeColor())
         self.status = label("Starting", NSMakeRect(55, 78, 330, 30), 22)
@@ -94,12 +101,16 @@ class AppDelegate(NSObject):
         self.hint = label(HINTS[self.mode], NSMakeRect(27, 14, 220, 22), 12, NSColor.tertiaryLabelColor())
         for view in (self.dot, self.status, self.detail, self.hint):
             background.addSubview_(view)
+        for view in (self.dot, self.status, self.detail):
+            view.setAutoresizingMask_(STICK_TOP)
+        self.hint.setAutoresizingMask_(STICK_BOTTOM)
 
         settings = NSButton.buttonWithTitle_target_action_("Keys…", self, "showSettings:")
         settings.setFrame_(NSMakeRect(343, 118, 65, 24))  # top right, in line with the title bar
         settings.setBezelStyle_(1)  # rounded, so the title shows (9 is the "?" help button)
         settings.setControlSize_(1)  # small
         settings.setFont_(NSFont.systemFontOfSize_(11))
+        settings.setAutoresizingMask_(STICK_TOP)
         background.addSubview_(settings)
 
         self.mode_switch = NSSegmentedControl.segmentedControlWithLabels_trackingMode_target_action_(
@@ -109,7 +120,9 @@ class AppDelegate(NSObject):
         self.mode_switch.setFont_(NSFont.systemFontOfSize_(11))
         self.mode_switch.setFrame_(NSMakeRect(252, 12, 156, 24))
         self.mode_switch.setSelectedSegment_(MODES.index(self.mode))
+        self.mode_switch.setAutoresizingMask_(STICK_BOTTOM)
         background.addSubview_(self.mode_switch)
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(0.5, self, "tick:", None, True)
 
         screen = NSScreen.mainScreen().visibleFrame()
         self.panel.setFrameOrigin_(NSMakePoint(screen.origin.x + (screen.size.width - 420) / 2,
@@ -276,6 +289,38 @@ class AppDelegate(NSObject):
         self.performSelectorOnMainThread_withObject_waitUntilDone_(
             "updateStatus:", {"state": state, "detail": detail}, False
         )
+
+    def tick_(self, _timer):
+        siri = sys.modules.get("siri")
+        timers = siri.timer_snapshot()[:3] if siri else []
+        if len(timers) != len(self.timer_rows):
+            self._layout_timer_rows(len(timers))
+        for (name_view, time_view), (name, left) in zip(self.timer_rows, timers):
+            name_view.setStringValue_(name)
+            m, sec = divmod(int(left + 0.999), 60)
+            h, m = divmod(m, 60)
+            time_view.setStringValue_(f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}")
+
+    @objc.python_method
+    def _layout_timer_rows(self, count):
+        for name_view, time_view in self.timer_rows:
+            name_view.removeFromSuperview()
+            time_view.removeFromSuperview()
+        self.timer_rows = []
+        frame = self.panel.frame()
+        height = BASE_HEIGHT + ROW * count + (8 if count else 0)
+        top = frame.origin.y + frame.size.height
+        self.panel.setFrame_display_animate_(NSMakeRect(frame.origin.x, top - height, frame.size.width, height), True, True)
+        for i in range(count):
+            y = 44 + ROW * (count - 1 - i)  # soonest on top, just above the bottom row
+            name_view = label("", NSMakeRect(27, y, 280, 20), 13, NSColor.secondaryLabelColor())
+            time_view = label("", NSMakeRect(310, y, 98, 20), 15, NSColor.systemTealColor())
+            time_view.setFont_(NSFont.monospacedDigitSystemFontOfSize_weight_(15, 0.4))
+            time_view.setAlignment_(2)  # right
+            for v in (name_view, time_view):
+                v.setAutoresizingMask_(STICK_BOTTOM)
+                self.background.addSubview_(v)
+            self.timer_rows.append((name_view, time_view))
 
     def updateStatus_(self, payload):
         state = str(payload["state"])
