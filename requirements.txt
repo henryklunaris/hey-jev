@@ -1,0 +1,8 @@
+requests>=2.32
+python-dotenv>=1.0
+numpy>=2.0
+sounddevice>=0.5
+soundfile>=0.13
+pynput>=1.8
+faster-whisper>=1.2
+pyobjc-framework-Cocoa>=11.0
