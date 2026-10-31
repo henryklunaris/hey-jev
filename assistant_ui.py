@@ -135,6 +135,7 @@ class AppDelegate(NSObject):
         if self.mode not in MODES:
             self.mode = "ptt"
         self.mic = defaults.stringForKey_("mic") or ""
+        self.auto_enter = bool(defaults.boolForKey_("auto_enter"))
         style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable
                  | NSWindowStyleMaskFullSizeContentView)
         self.panel = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -446,7 +447,20 @@ class AppDelegate(NSObject):
         page.addSubview_(self.mic_menu)
         self.mic_message = label("", NSMakeRect(24, y - 40, PAGE_W - 48, 20), 12, NSColor.secondaryLabelColor(), 0.0)
         page.addSubview_(self.mic_message)
+        y -= 90
+        page.addSubview_(label("Press Enter after pasting", NSMakeRect(24, y + 16, 300, 20), 14, weight=0.6))
+        page.addSubview_(label("Sends your dictation straight away, so you don't have to touch the keyboard.",
+                               NSMakeRect(24, y - 2, PAGE_W - 120, 18), 11, NSColor.secondaryLabelColor(), 0.0))
+        self.enter_box = NSButton.checkboxWithTitle_target_action_("", self, "autoEnterChanged:")
+        self.enter_box.setFrame_(NSMakeRect(PAGE_W - 44, y + 14, 24, 24))
+        self.enter_box.setState_(1 if self.auto_enter else 0)
+        page.addSubview_(self.enter_box)
         return page
+
+    def autoEnterChanged_(self, sender):
+        self.auto_enter = sender.state() == 1
+        NSUserDefaults.standardUserDefaults().setBool_forKey_(self.auto_enter, "auto_enter")
+        self.controls.put(("auto_enter", self.auto_enter))
 
     @objc.python_method
     def _load_mics(self):
@@ -719,7 +733,7 @@ class AppDelegate(NSObject):
     def _run_assistant(self):
         from siri import run_voice_assistant
         try:
-            run_voice_assistant(self.notify, self.controls, self.mode, self.mic)
+            run_voice_assistant(self.notify, self.controls, self.mode, self.mic, self.auto_enter)
         except Exception as exc:
             self.notify("Something went wrong", str(exc))
 

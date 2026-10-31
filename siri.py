@@ -774,7 +774,7 @@ def ready_text(wake):
     return "Say \u201cHey Jev\u201d and your command" if wake else "Ready when you are"
 
 
-def run_voice_assistant(notify=None, controls=None, mode="ptt", mic=""):
+def run_voice_assistant(notify=None, controls=None, mode="ptt", mic="", auto_enter=False):
     from faster_whisper import WhisperModel
     print("loading whisper...")
     emit(notify, "Starting", "Loading Whisper\u2026")
@@ -782,6 +782,7 @@ def run_voice_assistant(notify=None, controls=None, mode="ptt", mic=""):
     rec = Recorder(mic)
     busy = threading.Lock()
     armed_until = [0.0]
+    enter_after = [auto_enter]
     dictation = Dictation(NAMES, lambda: (OA_KEY, OR_KEY), SAMPLE_RATE)
     late_timers = []  # timers that went off mid-dictation, announced once it stops
 
@@ -849,8 +850,8 @@ def run_voice_assistant(notify=None, controls=None, mode="ptt", mic=""):
                 emit(notify, "Something went wrong", f"{failed} of {total} parts failed, not pasted. What worked is on your "
                      "clipboard, and the missing audio is in Logs/Hey Jev dictation failed")
             elif text:
-                paste(text)
-                emit(notify, "Ready", f"Pasted {len(text.split())} words")
+                paste(text, enter=enter_after[0])
+                emit(notify, "Ready", f"Pasted {len(text.split())} words" + (" and pressed Enter" if enter_after[0] else ""))
             else:
                 emit(notify, "Ready", "Didn't catch anything to paste")
         except Exception as exc:
@@ -969,6 +970,8 @@ def run_voice_assistant(notify=None, controls=None, mode="ptt", mic=""):
                 set_mode(command[1])
             elif isinstance(command, tuple) and command[0] == "mic":
                 rec.set_device(command[1])
+            elif isinstance(command, tuple) and command[0] == "auto_enter":
+                enter_after[0] = command[1]
             elif command == "press":
                 start_recording()
             elif command == "release":

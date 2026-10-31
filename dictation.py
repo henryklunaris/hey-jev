@@ -7,11 +7,13 @@ MODEL = "openai/gpt-4o-mini-transcribe"
 PROMPT = ("The following is a transcript of a person talking, you can remove and duplicated words and any fillers words. "
           "If its a longer transcript put into paragraphs for better readability.")
 CHUNK_SECS = 30  # audio goes off in chunks this long while you talk, so stopping is quick
-MAX_SECS = 15 * 60  # stops by itself after this, in case the stop phrase gets missed
+MAX_SECS = 2 * 60 * 60  # stops by itself after this, in case the stop phrase gets missed
 HERE = os.path.dirname(os.path.abspath(__file__))
 HISTORY = os.path.expanduser("~/Library/Logs/Hey Jev dictation.jsonl")
 FAILED_DIR = os.path.expanduser("~/Library/Logs/Hey Jev dictation failed")
-START = re.compile(r"^\W*(?:(?:please|can you|could you)\s+)?(?:start\s+)?(?:transcrib\w*|dictat\w*|take notes)"
+# Whisper often writes "transcribe" as Trenchcribe, Trend Scribe, Changecribe or Trench Club, so accept those too
+SCRIBE = r"(?:transcri\w*|(?:tran\w*|trench\w*|trend|change)\s?(?:s?crib\w*|club)|dictat\w*|record\w*)"
+START = re.compile(rf"^\W*(?:(?:please|can you|could you)\s+)?(?:start\s+)?(?:{SCRIBE}|take notes)"
                    r"(?:\s+(?:this|this meeting|this call|notes|mode|now|please|for me))?\W*$", re.I)
 
 USER_VOCAB = os.path.join(HERE, "vocabulary.json")  # your own words, gitignored
@@ -55,17 +57,20 @@ def strip_prompt(text):
     return cleaned if cleaned else text
 
 
-def paste(text):
+def paste(text, enter=False):
     subprocess.run(["pbcopy"], input=text.encode(), check=True)  # stays on the clipboard too, in case the paste misses
     time.sleep(0.2)
     # System Events, not pynput: pynput reads the keyboard layout, which crashes the app off the main thread
     subprocess.run(["osascript", "-e", 'tell application "System Events" to keystroke "v" using command down'], check=True)
+    if enter:
+        time.sleep(0.3)  # let the paste land before sending it
+        subprocess.run(["osascript", "-e", 'tell application "System Events" to key code 36'], check=True)
 
 
 class Dictation:
     def __init__(self, names, get_key, sample_rate):
         self.stop_rx = re.compile(rf"(?:\b(?:hey|hi|hay|okay|ok)\W+)?(?:\b(?:{names})\W+)?\b(?:stop|end|finish)\W+(?:the\W+)?"
-                                  r"(?:transcri|dictat)\w*\W*$", re.I)
+                                  rf"{SCRIBE}\W*$", re.I)
         self.get_key, self.rate = get_key, sample_rate
         self.pool = ThreadPoolExecutor(3)
         self.active = False
